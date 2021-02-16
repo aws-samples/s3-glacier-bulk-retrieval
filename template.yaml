@@ -1,0 +1,285 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  bulk-restore
+
+Globals:
+  Function:
+    Timeout: 3
+
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batchoperations.s3.amazonaws.com
+            Action:
+              - sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaRolePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: "iam:PassRole"
+                Resource: "*"
+              - Effect: Allow
+                Action: "s3:*"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+              - Effect: Allow
+                Action: "dynamodb:*"
+                Resource: "*"
+              - Effect: Allow
+                Action: "sns:*"
+                Resource: "*"
+              - Effect: Allow
+                Action: "sqs:*"
+                Resource: "*"
+
+  TriggerJobCheckRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Trigger job check rule"
+      ScheduleExpression: "rate(2 minutes)"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt TimeTriggerSNSFunction.Arn
+          Id: TimeTriggerSNSFunction
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TimeTriggerSNSFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt TriggerJobCheckRule.Arn
+
+  ReportBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireRule
+            Status: Enabled
+            ExpirationInDays: "28"
+
+  SQSQueue:
+    Type: AWS::SQS::Queue
+
+  SQSPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref SQSQueue
+      PolicyDocument:
+        Statement:
+          - Action:
+              - "SQS:SendMessage"
+            Effect: "Allow"
+            Resource: !GetAtt SQSQueue.Arn
+            Principal:
+              Service: s3.amazonaws.com
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: S3BulkRestoreEvents
+
+  SQSTopicQueue:
+    Type: AWS::SQS::Queue
+
+  SQSTopicPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref SQSTopicQueue
+      PolicyDocument:
+        Statement:
+          - Action:
+              - "SQS:SendMessage"
+            Effect: "Allow"
+            Resource: !GetAtt SQSTopicQueue.Arn
+            Principal:
+              Service: sns.amazonaws.com
+
+  SnsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      Endpoint: !GetAtt SQSTopicQueue.Arn
+      TopicArn: !Ref SNSTopic
+
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: "PAY_PER_REQUEST"
+      AttributeDefinitions:
+        - AttributeName: "JobId"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "JobId"
+          KeyType: "HASH"
+
+  FilesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: "PAY_PER_REQUEST"
+      AttributeDefinitions:
+        - AttributeName: "BucketName"
+          AttributeType: "S"
+        - AttributeName: "ObjectKey"
+          AttributeType: "S"
+        - AttributeName: "JobId"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "BucketName"
+          KeyType: "HASH"
+        - AttributeName: "ObjectKey"
+          KeyType: "RANGE"
+      GlobalSecondaryIndexes:
+        - IndexName: "JobIndex"
+          KeySchema:
+            - AttributeName: "JobId"
+              KeyType: "HASH"
+          Projection:
+            ProjectionType: "ALL"
+      TimeToLiveSpecification:
+        AttributeName: "TimeToLive"
+        Enabled: true
+
+  RestApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn:
+      - RestApiprodStage
+    Properties:
+      Name: !Join ["", [{ "Ref": "AWS::StackName" }, "-apikey"]]
+      Description: "Bulk Restore API Key"
+      Enabled: true
+      GenerateDistinctId: true
+      StageKeys:
+        - RestApiId: !Ref RestApi
+          StageName: prod
+
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn:
+      - RestApiprodStage
+    Properties:
+      ApiStages:
+        - ApiId: !Ref RestApi
+          Stage: prod
+      Description: !Join [" ", [{ "Ref": "AWS::StackName" }, "usage plan"]]
+      UsagePlanName: !Join ["", [{ "Ref": "AWS::StackName" }, "-usage-plan"]]
+
+  ApiUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    DependsOn:
+      - RestApiprodStage
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiUsagePlan
+
+  RestApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/api/
+      Handler: app.lambda_handler
+      Runtime: python3.8
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 900
+      MemorySize: 2048
+      Environment:
+        Variables:
+          ReportBucket: !GetAtt ReportBucket.Arn
+          JobsTable: !Ref JobsTable
+          FilesTable: !Ref FilesTable
+          RoleArn: !GetAtt LambdaRole.Arn
+          SNSTopic: !Ref SNSTopic
+          SQSQueue: !GetAtt SQSQueue.Arn
+          SQSTopicQueue: !GetAtt SQSTopicQueue.Arn
+      Events:
+        ApiRequest:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /create-job
+            Method: post
+            Auth:
+              ApiKeyRequired: true
+
+  RestApiFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${RestApiFunction}"
+      RetentionInDays: 30
+
+  S3RestoreFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/s3restore/
+      Handler: app.lambda_handler
+      Runtime: python3.8
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          JobsTable: !Ref JobsTable
+          FilesTable: !Ref FilesTable
+          RoleArn: !GetAtt LambdaRole.Arn
+          SNSTopic: !Ref SNSTopic
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SQSQueue.Arn
+            BatchSize: 10
+
+  S3RestoreFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${S3RestoreFunction}"
+      RetentionInDays: 30
+
+  TimeTriggerSNSFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/timetriggerSNS/
+      Handler: app.lambda_handler
+      Runtime: python3.8
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          RetentionJobTimeDays: "7"
+          JobsTable: !Ref JobsTable
+          FilesTable: !Ref FilesTable
+          RoleArn: !GetAtt LambdaRole.Arn
+          SNSTopic: !Ref SNSTopic
+
+  TimeTriggerSNSFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${TimeTriggerSNSFunction}"
+      RetentionInDays: 30
+
+Outputs:
+  RestAPI:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/"
