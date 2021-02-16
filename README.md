@@ -1,4 +1,5 @@
-# BulkGlacierRestore
+# S3 Glacier Bulk Retrieval
+
 S3 batch operations can help you create bulk operations for object restore but it does not provide a mechanism of bulk finished events or retrieval progress. That module provides that functionality and you can create bulk operations to restore thousands of objects and just receive only a few events per bulk request. Currently, using S3 API you need to handle an event for each restored object independently and create logic to group these events in one transaction by yourself. To help in that situation that module encapsulates that logic of handling thousands of independent events in one bulk transaction and notify the external app via SNS event. Also, it provides notification of restoration progress based on a number of restored objects through SNS or SQS. 
 
 That module provides described functionality below:
